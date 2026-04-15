@@ -1,0 +1,369 @@
+# Implementation Plan: AI-Powered Support Operations Platform
+
+## Overview
+
+This plan implements the AI-Powered Support Operations Platform as a TypeScript-based event-driven microservice system. Tasks are sequenced to build shared infrastructure first, then each service in dependency order, with property-based tests (using fast-check) placed close to the code they validate. Integration tests and the agent-facing UI are wired together in the final phase.
+
+## Tasks
+
+- [x] 1. Shared infrastructure and type definitions
+  - Create the monorepo/workspace structure with a `packages/` directory for each service and a `packages/shared` package
+  - Define all TypeScript interfaces from the design: `EmailPayload`, `AttachmentMetadata`, `Ticket`, `ClassifierConfidence`, `TicketStatus`, `TriageRecommendation`, `TriageOverride`, `TicketResolution`, `DraftResponse`, `Runbook`, `RunbookStep`, `AutomatedAction`, `ActionResult`, `TicketLifecycleEvent`, `SupportMetrics`, `EscalationPattern`, `KBArticle`, `Experiment`
+  - Define the 13 event topic constants and their payload types
+  - Set up fast-check as the property-based testing library and configure the shared test utilities (generators for `EmailPayload`, `Ticket`, `ClassificationResult`, `TriageRecommendation`, `DraftResponse`, `Runbook`, `TicketLifecycleEvent`)
+  - Configure a shared event bus client abstraction (Kafka/EventBridge adapter interface) with publish and subscribe methods
+  - _Requirements: 1.2, 2.3, 2.5_
+
+- [ ] 2. Email_Ingestion_Service
+  - [~] 2.1 Implement email ingestion and parsing
+    - Create `packages/email-ingestion-service` with IMAP polling and SMTP webhook receiver
+    - Implement email-to-`EmailPayload` parser (sender, subject, body_text, body_html, ingested_at, attachments)
+    - Implement attachment extraction: store binary content in object storage, populate `AttachmentMetadata` with storage reference
+    - Publish `email.ingested` on success; write raw email to dead-letter store and publish `email.parse_failed` on failure
+    - _Requirements: 1.1, 1.2, 1.3, 1.5_
+  - [~] 2.2 Write property test for email parsing completeness (Property 1)
+    - **Property 1: Email parsing produces complete structured payload**
+    - Generate random email structs varying sender, subject length, body encoding, and attachment count 0–10
+    - Assert every output contains sender_address, subject, body_text, ingested_at, and an attachments array
+    - **Validates: Requirements 1.2, 1.5**
+  - [~] 2.3 Write property test for malformed email dead-lettering (Property 2)
+    - **Property 2: Malformed emails are dead-lettered and alerted**
+    - Generate malformed byte sequences, truncated MIME, and invalid headers
+    - Assert both dead-letter write AND `email.parse_failed` event occur for every malformed input
+    - **Validates: Requirements 1.3**
+  - [~] 2.4 Implement email deduplication
+    - Back the `processed_message_ids` set with a Redis key-value store with 30-day TTL
+    - Before processing, check whether `message_id` is present; discard silently if so
+    - _Requirements: 1.4_
+  - [~] 2.5 Write property test for email deduplication idempotence (Property 3)
+    - **Property 3: Email deduplication is idempotent**
+    - Generate random emails submitted 2–5 times with the same message_id
+    - Assert exactly one `email.ingested` event is published regardless of submission count
+    - **Validates: Requirements 1.4**
+
+- [ ] 3. Extraction_Engine and AI_Classifier
+  - [~] 3.1 Implement Extraction_Engine
+    - Create `packages/extraction-engine`; consume `email.ingested` events
+    - Extract `customer_id`, `product_area`, `error_code` (optional), `issue_description`, `sentiment_score` (optional) using regex, NLP entity extraction, and LLM-assisted parsing
+    - Call AI_Classifier synchronously via gRPC with the extracted fields
+    - Pass combined extraction + classification output to Ticket_Service REST API
+    - _Requirements: 2.1_
+  - [~] 3.2 Implement AI_Classifier gRPC service
+    - Create `packages/ai-classifier`; expose `Classify(ExtractionResult) → ClassificationResult` gRPC endpoint
+    - Integrate LLM with structured output schema (function calling / JSON mode) to guarantee parseable responses
+    - Return `category`, `priority` (P1–P4), `routing_destination`, and per-dimension confidence scores in [0.0, 1.0]
+    - On timeout or error (default 10 s), return all confidence scores as 0.0
+    - _Requirements: 2.2_
+  - [~] 3.3 Write property test for AI_Classifier output validity (Property 4)
+    - **Property 4: AI_Classifier always produces a complete, valid classification**
+    - Generate random `ExtractionResult` structs; mock the LLM to return structured outputs
+    - Assert every `ClassificationResult` has non-empty category, priority in {P1,P2,P3,P4}, routing_destination in {Tier0,Tier1,PAM_Core,Integrations_Team}, and all confidence scores in [0.0, 1.0]
+    - **Validates: Requirements 2.2**
+
+- [ ] 4. Ticket_Service
+  - [~] 4.1 Implement Ticket_Service core
+    - Create `packages/ticket-service` with a PostgreSQL-backed ticket store
+    - Implement `POST /tickets` endpoint: assign UUID v4 `ticket_id`, set `created_at`, persist all extracted and classification fields
+    - Implement the confidence-gate rule: set `requires_human_review = true` when any confidence dimension < 0.70
+    - Implement the transactional outbox pattern: write the `ticket.created` event to an outbox table in the same transaction as the ticket insert; a relay process publishes outbox events to the event bus
+    - Implement `PATCH /tickets/{ticket_id}` for routing, resolution, and triage recording updates
+    - _Requirements: 2.3, 2.4, 2.5, 2.6_
+  - [~] 4.2 Write property test for ticket creation completeness (Property 5)
+    - **Property 5: Ticket creation preserves all input fields**
+    - Generate random (extraction_result, classification_result, email_message_id) triples
+    - Assert the created Ticket contains all extracted fields, all classification fields, the email_message_id, and a created_at timestamp
+    - **Validates: Requirements 2.3**
+  - [~] 4.3 Write property test for confidence gating (Property 6)
+    - **Property 6: Low-confidence classifications are flagged for human review**
+    - Generate ClassificationResult values with at least one dimension < 0.70 and all dimensions >= 0.70
+    - Assert requires_human_review = true for the former and false for the latter
+    - **Validates: Requirements 2.4**
+  - [~] 4.4 Write property test for ticket ID uniqueness and immutability (Property 7)
+    - **Property 7: Ticket identifiers are unique and immutable**
+    - Generate batches of N = 2–100 ticket creation requests
+    - Assert all ticket_ids are distinct; assert ticket_id is unchanged after routing and resolution updates
+    - **Validates: Requirements 2.5**
+
+- [~] 5. Checkpoint — core pipeline
+  - Run the full test suite for Email_Ingestion_Service, Extraction_Engine, AI_Classifier, and Ticket_Service; all tests must pass
+  - Verify the end-to-end flow via integration test: email ingested → extraction → classification → ticket created with outbox event published within SLA
+
+- [ ] 6. Triage_Engine
+  - [~] 6.1 Implement Triage_Engine routing logic
+    - Create `packages/triage-engine`; subscribe to `ticket.created` events
+    - Evaluate tickets using category, priority, customer tier, and historical resolution patterns to produce a `TriageRecommendation`
+    - Apply confidence gate: if confidence < 0.65, set routing_destination = Tier1 regardless of model prediction
+    - Call Ticket_Service `PATCH /tickets/{ticket_id}` to record the recommendation, confidence score, and recommended_at timestamp
+    - For P1 tickets, call the notification service (PagerDuty/SNS) within 2 minutes of the ticket.created event timestamp
+    - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5_
+  - [~] 6.2 Implement triage override endpoint
+    - Expose `POST /triage/{ticket_id}/override` accepting `{ destination, reason, agent_id }`
+    - Record the override (agent_id, new_destination, reason, overridden_at) on the Ticket and publish `triage.override`
+    - _Requirements: 3.6_
+  - [~] 6.3 Write property test for triage output validity (Property 8)
+    - **Property 8: Triage always produces a valid routing destination**
+    - Generate random Ticket structs; assert every TriageRecommendation has routing_destination in {Tier0,Tier1,PAM_Core,Integrations_Team} and confidence in [0.0, 1.0]
+    - **Validates: Requirements 3.1**
+  - [~] 6.4 Write property test for P1 urgency flag (Property 9)
+    - **Property 9: P1 tickets always receive an urgency flag**
+    - Generate random Tickets with priority = P1; assert TriageRecommendation includes urgency flag = true
+    - **Validates: Requirements 3.2**
+  - [~] 6.5 Write property test for low-confidence triage fallback (Property 10)
+    - **Property 10: Low-confidence triage falls back to Tier 1**
+    - Generate triage evaluations with confidence < 0.65; assert final routing_destination = Tier1
+    - **Validates: Requirements 3.4**
+  - [~] 6.6 Write property test for triage recommendation completeness (Property 11)
+    - **Property 11: Triage recommendations are fully recorded**
+    - Generate random TriageRecommendation inputs; assert stored record contains routing_destination, confidence, and recommended_at — all non-null
+    - **Validates: Requirements 3.5**
+  - [~] 6.7 Write property test for override recording completeness (Property 12)
+    - **Property 12: Triage overrides are fully recorded**
+    - Generate random override inputs; assert stored TriageOverride contains agent_id, new_destination, reason, and overridden_at — all non-null
+    - **Validates: Requirements 3.6**
+
+- [ ] 7. Observability_Service
+  - [~] 7.1 Implement event ingestion and storage
+    - Create `packages/observability-service`; subscribe to all 13 event topics
+    - Append each received event to an append-only time-series event store (ClickHouse or TimescaleDB) with millisecond-precision occurred_at timestamps
+    - Enforce 90-day TTL on raw event records
+    - _Requirements: 4.1, 4.6_
+  - [~] 7.2 Write property test for millisecond timestamp precision (Property 13)
+    - **Property 13: Lifecycle events are stored with millisecond-precision timestamps**
+    - Generate random TicketLifecycleEvent inputs; assert stored occurred_at ISO 8601 string includes at least three sub-second digits
+    - **Validates: Requirements 4.1**
+  - [~] 7.3 Implement metrics aggregation job
+    - Run a scheduled job every <=5 minutes to compute open_ticket_count, resolution_rates (24h/7d/30d by tier), and escalation_patterns from the event store
+    - Write results to a pre-aggregated metrics store (PostgreSQL or Redis)
+    - Expose `GET /metrics?window={24h|7d|30d}` REST endpoint for Dashboard consumption
+    - _Requirements: 4.2, 4.3, 4.4_
+  - [~] 7.4 Write property test for aggregated metrics accuracy (Property 14)
+    - **Property 14: Aggregated metrics accurately reflect ticket state**
+    - Generate random ticket state distributions with known counts; assert open_ticket_count, resolution_rates, and escalation_patterns match expected values
+    - **Validates: Requirements 4.2, 4.3, 4.4**
+  - [~] 7.5 Implement threshold alerting
+    - Configure metric thresholds (e.g., Tier 1 queue depth); when a metric exceeds its threshold, emit exactly one alert to the configured notification channel (Slack webhook / PagerDuty)
+    - _Requirements: 4.5_
+  - [~] 7.6 Write property test for threshold alerting (Property 15)
+    - **Property 15: Metric threshold breaches always trigger alerts**
+    - Generate metric values above and below thresholds; assert exactly one alert is emitted for values above threshold and none for values at or below
+    - **Validates: Requirements 4.5**
+  - [~] 7.7 Implement experiment metrics partitioning
+    - When computing metrics, group experiment-tagged ticket events by (experiment_id, group) to produce separate resolution_rate, time_to_resolution, and escalation_rate for control and experimental groups
+    - _Requirements: 7.4_
+  - [~] 7.8 Write property test for experiment metrics partitioning (Property 28)
+    - **Property 28: Experiment metrics are correctly partitioned by group**
+    - Generate random experiment-tagged event sets; assert control and experimental group metrics are computed independently with no cross-contamination
+    - **Validates: Requirements 7.4**
+
+- [ ] 8. Dashboard
+  - [~] 8.1 Implement Dashboard web application
+    - Create `packages/dashboard` as a TypeScript/React or Next.js web application
+    - Implement views: open ticket count, resolution rate by tier (24h/7d/30d selector), escalation patterns table
+    - Poll or use server-sent events to refresh from `GET /metrics` at intervals <=5 minutes; display staleness indicator when last refresh > 5 minutes ago
+    - _Requirements: 4.2, 4.3, 4.4, 4.7_
+  - [~] 8.2 Implement Dashboard authentication and access control
+    - Restrict Dashboard access to authenticated Agents and managers
+    - _Requirements: 4.7_
+
+- [~] 9. Checkpoint — observability and triage
+  - Run the full test suite for Triage_Engine, Observability_Service, and Dashboard; all tests must pass
+  - Verify via integration test that `ticket.created` events are consumed by Triage_Engine and recorded in Observability_Service within the 10-second SLA
+
+- [ ] 10. Knowledge_Base
+  - [~] 10.1 Implement Knowledge_Base vector store and search API
+    - Create `packages/knowledge-base`; configure a vector database (pgvector, Pinecone, or Weaviate) for article embeddings
+    - Implement `POST /knowledge-base/search` accepting query text; return ranked articles with similarity scores and article IDs
+    - Implement `POST /knowledge-base/articles` for ingesting new or updated articles (re-embed on update)
+    - _Requirements: 5.1, 5.2, 5.6_
+  - [~] 10.2 Implement Knowledge_Base scheduled update job
+    - Run a scheduled job at least once every 24 hours; ingest approved responses and Agent corrections from the Approval_Queue event log; re-embed changed articles and update the vector store
+    - _Requirements: 5.6_
+
+- [ ] 11. Auto_Response_Engine
+  - [~] 11.1 Implement draft response generation
+    - Create `packages/auto-response-engine`; subscribe to `ticket.routed` events where routing_destination = Tier0
+    - Query Knowledge_Base `POST /knowledge-base/search` to retrieve relevant articles
+    - Call LLM to generate draft response within 30 seconds; populate DraftResponse with draft_text, kb_article_id, confidence_score, and status = 'pending'
+    - Publish `response.draft_generated`; persist DraftResponse to database before publishing (outbox pattern)
+    - If no KB article above similarity threshold: route ticket to Tier1 and emit `kb.gap_identified`
+    - On LLM failure: retry with exponential backoff (max 3 retries); after exhausting retries, route to Tier1
+    - _Requirements: 5.1, 5.2, 5.7_
+  - [~] 11.2 Write property test for draft response completeness (Property 16)
+    - **Property 16: Draft responses always contain required fields**
+    - Generate random Tier 0 tickets with mock KB results; assert every DraftResponse has non-empty draft_text, non-null kb_article_id, and confidence_score in [0.0, 1.0]
+    - **Validates: Requirements 5.1, 5.2**
+  - [~] 11.3 Implement approval and rejection handlers
+    - Subscribe to `response.approved` events: send customer email via email delivery service, call Ticket_Service to mark ticket resolved
+    - Subscribe to `response.rejected` events: record rejection_reason on DraftResponse, route ticket to Tier1
+    - Enforce safety invariant: the send_response action is only reachable via the response.approved event path — no direct send code path exists
+    - _Requirements: 5.4, 5.5, 5.8_
+  - [~] 11.4 Write property test for approval triggering resolution (Property 17)
+    - **Property 17: Approval triggers resolution and customer send**
+    - Generate random approved DraftResponse events; assert both customer email send action and Ticket status = 'resolved' occur
+    - **Validates: Requirements 5.4**
+  - [~] 11.5 Write property test for rejection routing to Tier 1 (Property 18)
+    - **Property 18: Rejection routes ticket to Tier 1 with recorded reason**
+    - Generate random rejected DraftResponse events with rejection_reason; assert rejection_reason is recorded AND ticket is routed to Tier1
+    - **Validates: Requirements 5.5**
+  - [~] 11.6 Write property test for missing KB fallback (Property 19)
+    - **Property 19: Missing KB article triggers Tier 1 fallback and gap flag**
+    - Generate Tier 0 tickets with empty KB search results; assert ticket is routed to Tier1 AND kb.gap_identified event is emitted
+    - **Validates: Requirements 5.7**
+  - [~] 11.7 Write property test for no unapproved customer sends (Property 20)
+    - **Property 20: No customer response is sent without a recorded approval**
+    - Attempt to trigger send_response without a corresponding response.approved record; assert no customer email is sent
+    - **Validates: Requirements 5.8**
+
+- [ ] 12. Approval_Queue
+  - [~] 12.1 Implement Approval_Queue REST API
+    - Create `packages/approval-queue`; implement `GET /approval-queue` (list pending drafts for authenticated Agent)
+    - Implement `POST /approval-queue/{draft_id}/approve`: record approval (reviewed_by, reviewed_at), publish `response.approved`
+    - Implement `POST /approval-queue/{draft_id}/reject`: record rejection with `{ reason }`, publish `response.rejected`
+    - Implement `kb.update_scheduled` event publication after approval to trigger Knowledge_Base update job
+    - Implement configurable SLA timeout (default 4 hours): escalate to supervisor notification for unreviewed drafts
+    - _Requirements: 5.3, 5.4, 5.5, 5.6_
+  - [~] 12.2 Implement Approval_Queue web UI component
+    - Build the Agent-facing approval UI: display original email, draft response, and source Knowledge_Base article side-by-side
+    - Provide Approve and Reject (with reason input) actions
+    - _Requirements: 5.3_
+
+- [~] 13. Checkpoint — auto-response pipeline
+  - Run the full test suite for Knowledge_Base, Auto_Response_Engine, and Approval_Queue; all tests must pass
+  - Verify via integration test that the Tier 0 flow completes end-to-end: ticket routed → draft generated within 30 s → approval queue populated → approval triggers customer email send and ticket resolved
+
+- [ ] 14. Runbook_Service
+  - [~] 14.1 Implement Runbook storage and search
+    - Create `packages/runbook-service`; configure vector search (shared infrastructure with Knowledge_Base)
+    - Implement `POST /runbooks/search`: accept query text, return top-3 ranked Runbooks by relevance_score within 5 seconds
+    - Implement `GET /runbooks/{runbook_id}`: return full Runbook with all steps
+    - _Requirements: 6.1, 6.2, 6.3_
+  - [~] 14.2 Write property test for Runbook search ranking (Property 21)
+    - **Property 21: Runbook search results are ranked and bounded**
+    - Generate random queries with 1–10 matching runbooks; assert at most 3 results returned, ordered by descending relevance_score
+    - **Validates: Requirements 6.2**
+  - [~] 14.3 Write property test for Runbook step completeness (Property 22)
+    - **Property 22: Runbook steps always contain required fields**
+    - Generate random Runbook structs; assert every step has non-empty description and expected_outcome; when action is present, assert non-null action_type and action_reference
+    - **Validates: Requirements 6.3**
+  - [~] 14.4 Implement automated action execution
+    - Implement `POST /runbooks/{runbook_id}/steps/{step_id}/execute`: execute the step's action payload in an isolated sandbox (webhook call, Lambda invocation, or script execution)
+    - Capture stdout/stderr and exit code; return ActionResult with executed_at, success, output, and error_output
+    - On failure (success = false): populate error_output, halt automated execution, surface error to Agent — do not auto-execute subsequent steps
+    - _Requirements: 6.4, 6.7_
+  - [~] 14.5 Write property test for automated action result capture (Property 23)
+    - **Property 23: Automated action execution always produces a captured result**
+    - Generate random action configs (success and failure cases); assert every ActionResult contains executed_at, boolean success, and output string
+    - **Validates: Requirements 6.4**
+  - [~] 14.6 Write property test for failed action halting execution (Property 24)
+    - **Property 24: Failed automated actions halt execution and surface errors**
+    - Generate actions configured to fail at step N; assert error_output is populated and no subsequent steps are auto-executed
+    - **Validates: Requirements 6.7**
+  - [~] 14.7 Implement Runbook apply and resolution recording
+    - Implement `POST /runbooks/{runbook_id}/apply`: record ticket_id, runbook_id, resolution_timestamp; publish `runbook.applied` event
+    - Ticket_Service consumes `runbook.applied` and marks ticket resolved; sends automated resolution notification to Customer
+    - _Requirements: 6.5, 6.6_
+  - [~] 14.8 Write property test for Runbook apply record completeness (Property 25)
+    - **Property 25: Runbook application records are complete**
+    - Generate random apply inputs; assert stored record contains ticket_id, runbook_id, and resolution_timestamp — all non-null
+    - **Validates: Requirements 6.5**
+  - [~] 14.9 Implement Runbook authoring endpoints
+    - Implement `POST /runbooks` and `PUT /runbooks/{runbook_id}` for authorized Agents
+    - Enforce authorization: unauthorized agents receive HTTP 403
+    - _Requirements: 6.8_
+
+- [ ] 15. Funnel_Optimizer
+  - [~] 15.1 Implement weekly analysis job
+    - Create `packages/funnel-optimizer`; implement a weekly scheduled job that queries resolved tickets from Ticket_Service REST API (paginated, filtered by resolution date, last 7 days)
+    - Group by issue category; compute Tier 2 resolution rate; identify categories where rate > 80% with no existing Tier 0/Tier 1 automation
+    - Generate recommendation reports with issue_category, estimated_volume_impact, and suggested_automation_approach; store in Funnel_Optimizer's own data store
+    - _Requirements: 7.1, 7.2_
+  - [~] 15.2 Write property test for funnel analysis correctness (Property 26)
+    - **Property 26: Funnel analysis correctly identifies automation opportunities**
+    - Generate random resolved ticket datasets with known Tier 2 rates; assert recommendation list contains exactly those categories where Tier 2 rate > 80% AND no existing automation
+    - **Validates: Requirements 7.1**
+  - [~] 15.3 Write property test for recommendation report completeness (Property 27)
+    - **Property 27: Recommendation reports contain all required fields**
+    - Generate random opportunity inputs; assert every report has non-empty issue_category, numeric estimated_volume_impact, and non-empty suggested_automation_approach
+    - **Validates: Requirements 7.2**
+  - [~] 15.4 Implement A/B experiment configuration
+    - Implement `POST /experiments` (authorized managers only): create Experiment record with ticket_category, control_routing, experimental_routing, traffic_split_percent
+    - Push active experiment configurations to Triage_Engine as routing overrides; Triage_Engine tags matching tickets with experiment_id and group (control/experimental)
+    - Implement `GET /experiments/{experiment_id}/report`: retrieve experiment summary comparing control and experimental outcomes
+    - _Requirements: 7.3, 7.5_
+  - [~] 15.5 Implement automation coverage API
+    - Implement `GET /automation-coverage`: read-only endpoint returning current automation coverage metrics
+    - _Requirements: 7.6_
+
+- [~] 16. Checkpoint — runbooks and funnel optimization
+  - Run the full test suite for Runbook_Service and Funnel_Optimizer; all tests must pass
+  - Verify via integration test that runbook search returns results within 5 seconds and that the weekly analysis job produces recommendation reports with the correct structure
+
+- [ ] 17. Agent-facing UI integration
+  - [~] 17.1 Implement Agent portal shell
+    - Create `packages/agent-portal` as the unified Agent-facing web application
+    - Implement navigation between: Ticket queue, Approval Queue, Runbook search, and Dashboard views
+    - Implement authentication and role-based access (Agent vs. manager)
+    - _Requirements: 4.7, 5.3, 6.8_
+  - [~] 17.2 Implement Ticket queue view
+    - Display open tickets with status, priority, routing destination, and requires_human_review flag
+    - Allow Agents to trigger triage overrides via `POST /triage/{ticket_id}/override`
+    - _Requirements: 3.6_
+  - [~] 17.3 Implement Runbook search and execution UI
+    - Embed Runbook search (`POST /runbooks/search`) with query input and top-3 results display
+    - Display Runbook steps with description, expected outcome, and Execute button for automated actions
+    - Show ActionResult output inline after execution; display error state and halt message on failure
+    - Provide Apply Runbook action that calls `POST /runbooks/{runbook_id}/apply`
+    - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.7_
+  - [~] 17.4 Implement Runbook authoring UI
+    - Provide a structured form for authorized Agents to create and edit Runbooks (title, description, category, steps with optional automated actions)
+    - Call `POST /runbooks` and `PUT /runbooks/{runbook_id}` authoring endpoints
+    - _Requirements: 6.8_
+
+- [ ] 18. Integration tests
+  - [~] 18.1 Write email-to-ticket pipeline integration test
+    - Send a test email; assert ticket is created with correct fields within 60 s SLA
+    - Assert `ticket.created` event is consumed by Triage_Engine within 10 s
+    - _Requirements: 1.1, 2.6_
+  - [~] 18.2 Write P1 notification timing integration test
+    - Create a P1 ticket; assert notification is sent to on-call Agent within 2 minutes
+    - _Requirements: 3.2_
+  - [~] 18.3 Write Auto_Response_Engine timing integration test
+    - Route a Tier 0 ticket; assert draft response is generated and published within 30 seconds
+    - _Requirements: 5.1_
+  - [~] 18.4 Write Runbook retrieval timing integration test
+    - Submit a runbook query; assert response is returned within 5 seconds
+    - _Requirements: 6.1_
+  - [~] 18.5 Write Dashboard refresh timing integration test
+    - Change a ticket state; assert Dashboard metrics are updated within 5 minutes
+    - _Requirements: 4.2_
+  - [~] 18.6 Write Knowledge_Base update cadence integration test
+    - Approve a draft response; assert Knowledge_Base is updated within 24 hours
+    - _Requirements: 5.6_
+  - [~] 18.7 Write 90-day event retention integration test
+    - Insert a synthetic event with occurred_at = 89 days ago; assert it is still queryable from the event store
+    - _Requirements: 4.6_
+
+- [ ] 19. Smoke tests and final wiring
+  - [~] 19.1 Implement smoke test suite
+    - Assert Dashboard URL returns HTTP 200 with valid HTML
+    - Assert `GET /automation-coverage` returns HTTP 200 with valid JSON
+    - Assert event bus connectivity: all services can publish and consume test events
+    - Assert Knowledge_Base vector search endpoint is reachable and returns results for a known query
+    - _Requirements: 4.7, 7.6_
+  - [~] 19.2 Wire all services into the shared event bus
+    - Verify all 13 event topic subscriptions are registered at startup for each consuming service
+    - Verify the transactional outbox relay is running for Ticket_Service and Approval_Queue
+    - _Requirements: 2.6_
+
+- [~] 20. Final checkpoint — full platform
+  - Run the full test suite across all packages; all tests must pass
+  - Execute the smoke test suite against the integrated platform and assert all smoke test assertions pass
+
+## Notes
+
+- Tasks marked with `*` are optional and can be skipped for a faster MVP
+- All property-based tests use fast-check with a minimum of 100 iterations (50 for complex dataset generators)
+- Each property test is tagged with a comment: `// Feature: ai-support-ops-platform, Property N: <title>`
+- Shared generators (ticketGenerator, extractionResultGenerator, etc.) are defined in `packages/shared/test-generators` and reused across service test suites
+- The safety invariant (Property 20) is enforced at the Auto_Response_Engine code level, not as a UI convention
+- Integration tests require a running event bus, vector store, and database — use Docker Compose for local test environments
