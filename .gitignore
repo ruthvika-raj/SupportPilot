@@ -20,6 +20,7 @@ coverage/
 .DS_Store
 Thumbs.db
 
-# Editor files
-.vscode/settings.json
+# Editor and IDE files
+.vscode/
+.kiro/
 *.swp
