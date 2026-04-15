@@ -1,0 +1,25 @@
+# Dependencies — never commit these, they're reproducible via npm install
+node_modules/
+
+# Compiled output — generated from source, not source itself
+dist/
+build/
+
+# TypeScript build info cache
+*.tsbuildinfo
+
+# Test coverage reports
+coverage/
+
+# Environment variables — may contain secrets
+.env
+.env.local
+.env.*.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/settings.json
+*.swp
